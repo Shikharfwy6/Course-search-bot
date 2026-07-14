@@ -20,8 +20,24 @@ db_client = AsyncIOMotorClient(MONGO_URL)
 db = db_client["telegram_search_bot"]
 posts_collection = db["posts"]
 
-# Flask App Initialize (Variable name must be 'app' for Vercel)
+# Flask App Initialize
 app = Flask(__name__)
+
+
+# Helper function to run async tasks safely in sync Flask routes without closing the loop globally
+def run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    if loop.is_running():
+        # Agar loop pehle se chal raha hai (Vercel warm container), toh task create karein
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result()
+    else:
+        return loop.run_until_complete(coro)
 
 
 # --- 1. CHANNEL MONITORING (Save Posts) ---
@@ -109,8 +125,9 @@ def telegram_webhook():
         json_string = request.get_data().decode("utf-8")
         update = Update.model_validate_json(json_string, context={"bot": bot})
         
-        # Async dispatcher run karne ke liye loop open karein
-        asyncio.run(dp.feed_update(bot, update))
+        # Safe async implementation using our helper utility
+        run_async(dp.feed_update(bot, update))
+        
         return jsonify({"status": "ok"}), 200
     else:
         return jsonify({"error": "Unsupported Media Type"}), 415
@@ -126,6 +143,6 @@ def index():
 def setup_webhook():
     if VERCEL_URL:
         webhook_url = f"https://{VERCEL_URL}/webhook"
-        asyncio.run(bot.set_webhook(url=webhook_url))
+        run_async(bot.set_webhook(url=webhook_url))
         return f"Webhook successfully set to: {webhook_url}", 200
     return "VERCEL_URL environment variable is missing!", 400
