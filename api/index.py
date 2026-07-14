@@ -1,15 +1,15 @@
 import os
 import asyncio
-from fastapi import FastAPI, Request
+from flask import Flask, request, jsonify
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Update
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# Environment Variables (Vercel Dashboard se set honge)
+# Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1004436698454"))
-VERCEL_URL = os.getenv("VERCEL_URL")  # e.g., my-bot.vercel.app
+VERCEL_URL = os.getenv("VERCEL_URL")  # e.g., course-search-bot.vercel.app
 
 # Initialize Bot and Dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -20,13 +20,13 @@ db_client = AsyncIOMotorClient(MONGO_URL)
 db = db_client["telegram_search_bot"]
 posts_collection = db["posts"]
 
-# FastAPI App
-app = FastAPI()
+# Flask App Initialize
+flask_app = Flask(__name__)
+
 
 # --- 1. CHANNEL MONITORING (Save Posts) ---
 @dp.channel_post()
 async def handle_channel_post(message: types.Message):
-    # Sirf targeted channel ki posts save karein
     if message.chat.id != CHANNEL_ID:
         return
 
@@ -54,7 +54,6 @@ async def handle_user_search(message: types.Message):
     if not query:
         return
 
-    # MongoDB me regex search (case-insensitive)
     cursor = posts_collection.find({"caption": {"$regex": query, "$options": "i"}})
     results = await cursor.to_list(length=100)
     
@@ -65,8 +64,6 @@ async def handle_user_search(message: types.Message):
         return
 
     response_text = f"Total **({total_found})** found"
-    
-    # Callback data limit 64 bytes hoti hai, isliye search query ko short rakh rahe hain
     callback_data = f"get_{query[:30]}"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -93,7 +90,6 @@ async def send_all_posts(callback_query: types.CallbackQuery):
 
     for post in results:
         try:
-            # Vercel timeout se bachne ke liye forward fast karenge
             await bot.forward_message(
                 chat_id=user_id,
                 from_chat_id=post["chat_id"],
@@ -106,24 +102,30 @@ async def send_all_posts(callback_query: types.CallbackQuery):
     await bot.send_message(user_id, "✅ Saari posts upar bhej di gayi hain!")
 
 
-# --- WEBHOOK ROUTING FOR VERCEL ---
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    update_data = await request.json()
-    update = Update.model_validate(update_data, context={"bot": bot})
-    await dp.feed_update(bot, update)
-    return {"status": "ok"}
+# --- FLASK WEBHOOK ROUTING ---
+@flask_app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    if request.headers.get("content-type") == "application/json":
+        json_string = request.get_data().decode("utf-8")
+        update = Update.model_validate_json(json_string, context={"bot": bot})
+        
+        # Async functions ko Flask ke sync route me run karne ke liye asyncio loop ka use karein
+        asyncio.run(dp.feed_update(bot, update))
+        return jsonify({"status": "ok"}), 200
+    else:
+        return jsonify({"error": "Unsupported Media Type"}), 415
 
 
-@app.get("/")
-async def index():
-    return {"message": "Bot is running on Vercel!"}
+@flask_app.route("/")
+def index():
+    return "Bot is running on Vercel with Flask!", 200
 
 
-# Webhook auto setup on startup
-@app.on_event("startup")
-async def on_startup():
+# Webhook check/setup helper (Aap ise browser me manually call kar sakte hain webhook set karne ke liye)
+@flask_app.route("/set_webhook")
+def setup_webhook():
     if VERCEL_URL:
         webhook_url = f"https://{VERCEL_URL}/webhook"
-        await bot.set_webhook(url=webhook_url)
-        print(f"Webhook set to: {webhook_url}")
+        asyncio.run(bot.set_webhook(url=webhook_url))
+        return f"Webhook successfully set to: {webhook_url}", 200
+    return "VERCEL_URL environment variable is missing!", 400
