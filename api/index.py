@@ -1,5 +1,4 @@
 import os
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from aiogram import Bot, Dispatcher, types, F
@@ -12,27 +11,19 @@ MONGO_URL = os.getenv("MONGO_URL")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1004436698454"))
 VERCEL_URL = os.getenv("VERCEL_URL")  # e.g., course-search-bot.vercel.app
 
-# Initialize Bot and Dispatcher global scope me rahenge
+# Initialize Bot and Dispatcher
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Global db reference bad me initialize karne ke liye
-db_client = None
-posts_collection = None
+# FastAPI App initialization without complex lifespan
+app = FastAPI()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global db_client, posts_collection
-    # Container start hone par connection banega jo lifecycle maintain rakhega
-    db_client = AsyncIOMotorClient(MONGO_URL)
-    db = db_client["telegram_search_bot"]
-    posts_collection = db["posts"]
-    yield
-    # Container shut down hone par safe close
-    db_client.close()
-
-# FastAPI Initialization (Variable name must be 'app')
-app = FastAPI(lifespan=lifespan)
+# Dynamic Database Connection Helper (Lazy Initialization)
+def get_collection():
+    # Har request par connection pool check karega, closed ya state-issue nahi aayega
+    client = AsyncIOMotorClient(MONGO_URL)
+    db = client["telegram_search_bot"]
+    return db["posts"]
 
 
 # --- 1. CHANNEL MONITORING (Save Posts) ---
@@ -51,21 +42,22 @@ async def handle_channel_post(message: types.Message):
         "chat_id": message.chat.id
     }
 
-    if posts_collection is not None:
-        await posts_collection.update_one(
-            {"message_id": message.message_id},
-            {"$set": post_data},
-            upsert=True
-        )
+    posts_collection = get_collection()
+    await posts_collection.update_one(
+        {"message_id": message.message_id},
+        {"$set": post_data},
+        upsert=True
+    )
 
 
 # --- 2. USER SEARCH (Keyword/Sentence) ---
 @dp.message(F.chat.type == "private")
 async def handle_user_search(message: types.Message):
     query = message.text
-    if not query or posts_collection is None:
+    if not query:
         return
 
+    posts_collection = get_collection()
     cursor = posts_collection.find({"caption": {"$regex": query, "$options": "i"}})
     results = await cursor.to_list(length=100)
     
@@ -93,9 +85,7 @@ async def send_all_posts(callback_query: types.CallbackQuery):
 
     await callback_query.answer("Sending posts... Please wait.")
 
-    if posts_collection is None:
-        return
-
+    posts_collection = get_collection()
     cursor = posts_collection.find({"caption": {"$regex": search_query, "$options": "i"}})
     results = await cursor.to_list(length=100)
 
@@ -122,16 +112,16 @@ async def telegram_webhook(request: Request):
     try:
         update_data = await request.json()
         update = Update.model_validate(update_data, context={"bot": bot})
-        # FastAPI khud async hai, isliye bina kisi external run ya loop close issue ke natively feed karega
         await dp.feed_update(bot, update)
         return {"status": "ok"}
     except Exception as e:
+        # Agar koi internal issue aaye toh exact error trace response me mil sake
         return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"error": str(e)})
 
 
 @app.get("/")
 async def index():
-    return {"message": "Bot is running stably on Vercel with FastAPI ASGI!"}
+    return {"message": "Bot is running stably on Vercel!"}
 
 
 # Webhook auto-setup helper route
