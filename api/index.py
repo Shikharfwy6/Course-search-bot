@@ -20,8 +20,8 @@ db_client = AsyncIOMotorClient(MONGO_URL)
 db = db_client["telegram_search_bot"]
 posts_collection = db["posts"]
 
-# Flask App Initialize
-flask_app = Flask(__name__)
+# Flask App Initialize (Variable name must be 'app' for Vercel)
+app = Flask(__name__)
 
 
 # --- 1. CHANNEL MONITORING (Save Posts) ---
@@ -103,26 +103,26 @@ async def send_all_posts(callback_query: types.CallbackQuery):
 
 
 # --- FLASK WEBHOOK ROUTING ---
-@flask_app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     if request.headers.get("content-type") == "application/json":
         json_string = request.get_data().decode("utf-8")
         update = Update.model_validate_json(json_string, context={"bot": bot})
         
-        # Async functions ko Flask ke sync route me run karne ke liye asyncio loop ka use karein
+        # Async dispatcher run karne ke liye loop open karein
         asyncio.run(dp.feed_update(bot, update))
         return jsonify({"status": "ok"}), 200
     else:
         return jsonify({"error": "Unsupported Media Type"}), 415
 
 
-@flask_app.route("/")
+@app.route("/")
 def index():
     return "Bot is running on Vercel with Flask!", 200
 
 
-# Webhook check/setup helper (Aap ise browser me manually call kar sakte hain webhook set karne ke liye)
-@flask_app.route("/set_webhook")
+# Webhook auto setup helper
+@app.route("/set_webhook")
 def setup_webhook():
     if VERCEL_URL:
         webhook_url = f"https://{VERCEL_URL}/webhook"
