@@ -1,6 +1,7 @@
 import os
-import asyncio
-from flask import Flask, request, jsonify
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Update
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -11,33 +12,27 @@ MONGO_URL = os.getenv("MONGO_URL")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1004436698454"))
 VERCEL_URL = os.getenv("VERCEL_URL")  # e.g., course-search-bot.vercel.app
 
-# Initialize Bot and Dispatcher
+# Initialize Bot and Dispatcher global scope me rahenge
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# MongoDB Connection
-db_client = AsyncIOMotorClient(MONGO_URL)
-db = db_client["telegram_search_bot"]
-posts_collection = db["posts"]
+# Global db reference bad me initialize karne ke liye
+db_client = None
+posts_collection = None
 
-# Flask App Initialize
-app = Flask(__name__)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_client, posts_collection
+    # Container start hone par connection banega jo lifecycle maintain rakhega
+    db_client = AsyncIOMotorClient(MONGO_URL)
+    db = db_client["telegram_search_bot"]
+    posts_collection = db["posts"]
+    yield
+    # Container shut down hone par safe close
+    db_client.close()
 
-
-# Helper function to run async tasks safely in sync Flask routes without closing the loop globally
-def run_async(coro):
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    if loop.is_running():
-        # Agar loop pehle se chal raha hai (Vercel warm container), toh task create karein
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result()
-    else:
-        return loop.run_until_complete(coro)
+# FastAPI Initialization (Variable name must be 'app')
+app = FastAPI(lifespan=lifespan)
 
 
 # --- 1. CHANNEL MONITORING (Save Posts) ---
@@ -56,18 +51,19 @@ async def handle_channel_post(message: types.Message):
         "chat_id": message.chat.id
     }
 
-    await posts_collection.update_one(
-        {"message_id": message.message_id},
-        {"$set": post_data},
-        upsert=True
-    )
+    if posts_collection is not None:
+        await posts_collection.update_one(
+            {"message_id": message.message_id},
+            {"$set": post_data},
+            upsert=True
+        )
 
 
 # --- 2. USER SEARCH (Keyword/Sentence) ---
 @dp.message(F.chat.type == "private")
 async def handle_user_search(message: types.Message):
     query = message.text
-    if not query:
+    if not query or posts_collection is None:
         return
 
     cursor = posts_collection.find({"caption": {"$regex": query, "$options": "i"}})
@@ -97,6 +93,9 @@ async def send_all_posts(callback_query: types.CallbackQuery):
 
     await callback_query.answer("Sending posts... Please wait.")
 
+    if posts_collection is None:
+        return
+
     cursor = posts_collection.find({"caption": {"$regex": search_query, "$options": "i"}})
     results = await cursor.to_list(length=100)
 
@@ -111,38 +110,35 @@ async def send_all_posts(callback_query: types.CallbackQuery):
                 from_chat_id=post["chat_id"],
                 message_id=post["message_id"]
             )
-            await asyncio.sleep(0.3)
         except Exception as e:
             print(f"Failed to forward: {e}")
 
     await bot.send_message(user_id, "✅ Saari posts upar bhej di gayi hain!")
 
 
-# --- FLASK WEBHOOK ROUTING ---
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    if request.headers.get("content-type") == "application/json":
-        json_string = request.get_data().decode("utf-8")
-        update = Update.model_validate_json(json_string, context={"bot": bot})
-        
-        # Safe async implementation using our helper utility
-        run_async(dp.feed_update(bot, update))
-        
-        return jsonify({"status": "ok"}), 200
-    else:
-        return jsonify({"error": "Unsupported Media Type"}), 415
+# --- NATIVE ASYNCHRONOUS WEBHOOK ROUTE ---
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        update_data = await request.json()
+        update = Update.model_validate(update_data, context={"bot": bot})
+        # FastAPI khud async hai, isliye bina kisi external run ya loop close issue ke natively feed karega
+        await dp.feed_update(bot, update)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"error": str(e)})
 
 
-@app.route("/")
-def index():
-    return "Bot is running on Vercel with Flask!", 200
+@app.get("/")
+async def index():
+    return {"message": "Bot is running stably on Vercel with FastAPI ASGI!"}
 
 
-# Webhook auto setup helper
-@app.route("/set_webhook")
-def setup_webhook():
+# Webhook auto-setup helper route
+@app.get("/set_webhook")
+async def setup_webhook():
     if VERCEL_URL:
         webhook_url = f"https://{VERCEL_URL}/webhook"
-        run_async(bot.set_webhook(url=webhook_url))
-        return f"Webhook successfully set to: {webhook_url}", 200
-    return "VERCEL_URL environment variable is missing!", 400
+        await bot.set_webhook(url=webhook_url)
+        return {"message": f"Webhook successfully set to: {webhook_url}"}
+    return {"error": "VERCEL_URL environment variable is missing!"}
