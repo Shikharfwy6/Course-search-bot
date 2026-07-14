@@ -1,134 +1,122 @@
 import os
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Update
-from motor.motor_asyncio import AsyncIOMotorClient
+import re
+from flask import Flask, request, jsonify
+import requests
+from pymongo import MongoClient
 
-# Environment Variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URL = os.getenv("MONGO_URL")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1004436698454"))
-VERCEL_URL = os.getenv("VERCEL_URL")  # e.g., course-search-bot.vercel.app
+app = Flask(__name__)
 
-# Initialize Bot and Dispatcher
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# Environment Variables (Vercel Dashboard me add karein)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MONGO_URI = os.environ.get("MONGO_URI")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) # E.g., -1004436698454
 
-# FastAPI App initialization without complex lifespan
-app = FastAPI()
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Dynamic Database Connection Helper (Lazy Initialization)
-def get_collection():
-    # Har request par connection pool check karega, closed ya state-issue nahi aayega
-    client = AsyncIOMotorClient(MONGO_URL)
-    db = client["telegram_search_bot"]
-    return db["posts"]
+# MongoDB Setup
+client = MongoClient(MONGO_URI)
+db = client['telegram_bot_db']
+posts_collection = db['posts']
 
+@app.route('/', methods=['GET'])
+def home():
+    return "Bot is running 24/7 on Vercel!"
 
-# --- 1. CHANNEL MONITORING (Save Posts) ---
-@dp.channel_post()
-async def handle_channel_post(message: types.Message):
-    if message.chat.id != CHANNEL_ID:
-        return
-
-    caption = message.text or message.caption or ""
-    if not caption:
-        return
-
-    post_data = {
-        "message_id": message.message_id,
-        "caption": caption,
-        "chat_id": message.chat.id
-    }
-
-    posts_collection = get_collection()
-    await posts_collection.update_one(
-        {"message_id": message.message_id},
-        {"$set": post_data},
-        upsert=True
-    )
-
-
-# --- 2. USER SEARCH (Keyword/Sentence) ---
-@dp.message(F.chat.type == "private")
-async def handle_user_search(message: types.Message):
-    query = message.text
-    if not query:
-        return
-
-    posts_collection = get_collection()
-    cursor = posts_collection.find({"caption": {"$regex": query, "$options": "i"}})
-    results = await cursor.to_list(length=100)
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    update = request.get_json()
     
-    total_found = len(results)
+    if not update:
+        return jsonify({"status": "error", "message": "No payload"}), 400
 
-    if total_found == 0:
-        await message.reply("❌ Koi bhi post nahi mili. Kuch aur search karein.")
-        return
-
-    response_text = f"Total **({total_found})** found"
-    callback_data = f"get_{query[:30]}"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Get All Posts", callback_data=callback_data)]
-    ])
-
-    await message.reply(response_text, reply_markup=keyboard)
-
-
-# --- 3. GET ALL POSTS BUTTON HANDLER ---
-@dp.callback_query(F.data.startswith("get_"))
-async def send_all_posts(callback_query: types.CallbackQuery):
-    search_query = callback_query.data.split("_", 1)[1]
-    user_id = callback_query.from_user.id
-
-    await callback_query.answer("Sending posts... Please wait.")
-
-    posts_collection = get_collection()
-    cursor = posts_collection.find({"caption": {"$regex": search_query, "$options": "i"}})
-    results = await cursor.to_list(length=100)
-
-    if not results:
-        await bot.send_message(user_id, "❌ Error: Posts not found anymore.")
-        return
-
-    for post in results:
-        try:
-            await bot.forward_message(
-                chat_id=user_id,
-                from_chat_id=post["chat_id"],
-                message_id=post["message_id"]
+    # 1. Channel ki nayi post ko save karna
+    if "channel_post" in update:
+        post = update["channel_post"]
+        chat_id = post["chat"]["id"]
+        
+        # Check agar post usi target channel se hai
+        if chat_id == CHANNEL_ID:
+            message_id = post["message_id"]
+            caption = post.get("caption") or post.get("text") or ""
+            
+            # Telegram Private Channel Link Format: https://telegram.me/c/CHANNEL_ID_WITHOUT_100/MESSAGE_ID
+            clean_channel_id = str(CHANNEL_ID).replace("-100", "")
+            post_link = f"https://telegram.me/c/{clean_channel_id}/{message_id}"
+            
+            # MongoDB me insert ya update karein
+            posts_collection.update_one(
+                {"message_id": message_id},
+                {"$set": {"caption": caption, "link": post_link}},
+                upsert=True
             )
-        except Exception as e:
-            print(f"Failed to forward: {e}")
+            return jsonify({"status": "success", "message": "Post saved"}), 200
 
-    await bot.send_message(user_id, "✅ Saari posts upar bhej di gayi hain!")
+    # 2. User ka Bot par message handle karna (Search Functionality)
+    elif "message" in update:
+        message = update["message"]
+        chat_id = message["chat"]["id"]
+        user_text = message.get("text", "").strip()
+        
+        # Agar user inline button par click karta hai (Callback Query)
+        # Note: Callback queries niche alag se handled hain, ye normal text search ke liye hai.
+        if user_text:
+            if user_text.startswith('/start'):
+                send_message(chat_id, "Welcome! Kuch bhi keyword bhejein post search karne ke liye.")
+                return jsonify({"status": "ok"}), 200
+            
+            # MongoDB me case-insensitive regex search
+            query = {"caption": {"$regex": re.escape(user_text), "$options": "i"}}
+            results_count = posts_collection.count_documents(query)
+            
+            if results_count > 0:
+                # Reply message text aur inline button
+                reply_text = f"Total {results_count} found"
+                reply_markup = {
+                    "inline_keyboard": [[
+                        {"text": "🎁 Get All Post", "callback_data": f"get_all:{user_text}"}
+                    ]]
+                }
+                send_message(chat_id, reply_text, reply_markup)
+            else:
+                send_message(chat_id, "Sorry, koi post nahi mili!")
 
+    # 3. Inline Button (Callback Query) Handle karna
+    elif "callback_query" in update:
+        callback = update["callback_query"]
+        chat_id = callback["message"]["chat"]["id"]
+        callback_data = callback["data"]
+        
+        if callback_data.startswith("get_all:"):
+            search_keyword = callback_data.split(":", 1)[1]
+            
+            query = {"caption": {"$regex": re.escape(search_keyword), "$options": "i"}}
+            posts = posts_collection.find(query)
+            
+            # Saari posts ke links user ko bhejna
+            response_text = f"📚 Here are the posts for '{search_keyword}':\n\n"
+            for index, post in enumerate(posts, 1):
+                caption_snippet = post['caption'][:30] + "..." if len(post['caption']) > 30 else post['caption']
+                response_text += f"{index}. {caption_snippet}\n🔗 {post['link']}\n\n"
+                
+                # Agar text bada ho jaye to break karke bhej sakte hain (Telegram limit 4096 chars)
+                if len(response_text) > 3500:
+                    send_message(chat_id, response_text)
+                    response_text = ""
+            
+            if response_text:
+                send_message(chat_id, response_text)
+                
+            # Telegram ko acknowledge karna ki callback process ho gaya
+            requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
 
-# --- NATIVE ASYNCHRONOUS WEBHOOK ROUTE ---
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    try:
-        update_data = await request.json()
-        update = Update.model_validate(update_data, context={"bot": bot})
-        await dp.feed_update(bot, update)
-        return {"status": "ok"}
-    except Exception as e:
-        # Agar koi internal issue aaye toh exact error trace response me mil sake
-        return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"error": str(e)})
+    return jsonify({"status": "ok"}), 200
 
+def send_message(chat_id, text, reply_markup=None):
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    requests.post(url, json=payload)
 
-@app.get("/")
-async def index():
-    return {"message": "Bot is running stably on Vercel!"}
-
-
-# Webhook auto-setup helper route
-@app.get("/set_webhook")
-async def setup_webhook():
-    if VERCEL_URL:
-        webhook_url = f"https://{VERCEL_URL}/webhook"
-        await bot.set_webhook(url=webhook_url)
-        return {"message": f"Webhook successfully set to: {webhook_url}"}
-    return {"error": "VERCEL_URL environment variable is missing!"}
+# Vercel requirements ke liye app export
+app = app
