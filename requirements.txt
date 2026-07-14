@@ -3,4 +3,4 @@ uvicorn
 aiogram==3.15.0
 motor
 pymongo
-dnsauth
+dnspython
